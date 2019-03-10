@@ -1,0 +1,386 @@
+Description: <short summary of the patch>
+ TODO: Put a short summary on the line above and replace this paragraph
+ with a longer explanation of this change. Complete the meta-information
+ with other relevant fields (see below for details). To make it easier, the
+ information below has been extracted from the changelog. Adjust it or drop
+ it.
+ .
+ libauthen-kerberos-perl (0.03-1) unstable; urgency=medium
+ .
+   * New internal release.
+     - Add initial Authen::Kerberos module that wraps just enough of the
+       regular Kerberos API to list the contents of a keytab and to obtain
+       credentials from a keytab.
+     - Add get, list, and modify Authen::Kerberos::Kadmin methods.
+     - Add a representation of Kerberos database entries and methods to
+       inspect the attributes, last password change time, and password
+       expiration time and to change the latter.
+     - Add an example script to list principals without a recent password
+       change.
+Author: Russ Allbery <rra@debian.org>
+
+---
+The information above should follow the Patch Tagging Guidelines, please
+checkout http://dep.debian.net/deps/dep3/ to learn about the format. Here
+are templates for supplementary fields that you might want to add:
+
+Origin: <vendor|upstream|other>, <url of original patch>
+Bug: <url in upstream bugtracker>
+Bug-Debian: https://bugs.debian.org/<bugnumber>
+Bug-Ubuntu: https://launchpad.net/bugs/<bugnumber>
+Forwarded: <no|not-needed|url proving that it has been forwarded>
+Reviewed-By: <name and email of someone who approved the patch>
+Last-Update: 2019-03-10
+
+--- libauthen-kerberos-perl-0.03.orig/Build.PL
++++ libauthen-kerberos-perl-0.03/Build.PL
+@@ -3,6 +3,7 @@
+ # Build script for the Authen::Kerberos distribution.
+ #
+ # Written by Russ Allbery <rra@cpan.org>
++# Copyright 2017 Russ Allbery <rra@cpan.org>
+ # Copyright 2014
+ #     The Board of Trustees of the Leland Stanford Junior University
+ #
+@@ -36,91 +37,6 @@ use File::Spec;
+ use IPC::System::Simple qw(capturex);
+ use Module::Build;
+ 
+-# Check whether it's possible to link a program that uses a particular
+-# function.  This is written like a Config::AutoConf method and should ideally
+-# be incorporated into that module.  This macro caches its result in the
+-# ac_cv_func_FUNCTION variable.
+-#
+-# $self         - The Config::AutoConf state object
+-# $function     - The function to check for
+-# $found_ref    - Code reference to call if the function was found
+-# $notfound_ref - Code reference to call if the function wasn't found
+-#
+-# Returns: True if the function was found, false otherwise
+-sub check_func {
+-    my ($self, $function, $found_ref, $notfound_ref) = @_;
+-    $self = $self->_get_instance();
+-
+-    # Build the name of the cache variable.
+-    my $cache_name = $self->_cache_name('func', $function);
+-
+-    # Wrap the actual check in a closure so that we can use check_cached.
+-    my $check_sub = sub {
+-        my $have_func = $self->link_if_else($self->lang_call(q{}, $function));
+-        if ($have_func) {
+-            if (defined($found_ref) && ref($found_ref) eq 'CODE') {
+-                $found_ref->();
+-            }
+-        } else {
+-            if (defined($notfound_ref) && ref($notfound_ref) eq 'CODE') {
+-                $notfound_ref->();
+-            }
+-        }
+-        return $have_func;
+-    };
+-
+-    # Run the check and cache the results.
+-    return $self->check_cached($cache_name, "for $function", $check_sub);
+-}
+-
+-# The same as check_func, but takes a list of functions to look for and checks
+-# for each in turn.  Define HAVE_FUNCTION for each function that was found,
+-# and also run the $found_ref code each time a function was found.  Run the
+-# $notfound_ref code each time a function wasn't found.  Both code references
+-# are passed the name of the function that was found.
+-#
+-# $self          - The Config::AutoConf state object
+-# $functions_ref - Reference to an array of functions to check for
+-# $found_ref     - Code reference to call if a function was found
+-# $notfound_ref  - Code reference to call if a function wasn't found
+-#
+-# Returns: True if all functions were found, false otherwise.
+-sub check_funcs {
+-    my ($self, $functions_ref, $user_found_ref, $user_notfound_ref) = @_;
+-    $self = $self->_get_instance();
+-
+-    # Build the code reference to run when a function was found.  This defines
+-    # a HAVE_FUNCTION symbol, plus runs the current $found_ref if there is
+-    # one.
+-    my $func_found_ref = sub {
+-        my ($function) = @_;
+-
+-        # Generate the name of the symbol we'll define.
+-        my $have_func_name = 'HAVE_' . uc($function);
+-        $have_func_name =~ tr/_A-Za-z0-9/_/c;
+-
+-        # Define the symbol.
+-        $self->define_var($have_func_name, 1,
+-            "Defined when $function is available");
+-
+-        # Run the user-provided hook, if there is one.
+-        if (defined($user_found_ref) && ref($user_found_ref) eq 'CODE') {
+-            $user_found_ref->($function);
+-        }
+-    };
+-
+-    # Go through the list of functions and call check_func for each one.  We
+-    # generate new closures for the found and not-found functions that pass in
+-    # the relevant function name.
+-    my $return = 1;
+-    for my $function (@{$functions_ref}) {
+-        my $found_ref    = sub { $func_found_ref->($function) };
+-        my $notfound_ref = sub { $user_notfound_ref->($function) };
+-        $return &= check_func($self, $function, $found_ref, $notfound_ref);
+-    }
+-    return $return;
+-}
+-
+ # Returns C code that includes the given headers.  Used to construct prologues
+ # for check functions.
+ #
+@@ -159,6 +75,11 @@ sub config_kerberos {
+     $config->check_type('ssize_t', undef, undef, include('sys/types.h'));
+ 
+     # If the user passed extra flags into Build.PL, use them for probes.
++    if ($build->extra_compiler_flags) {
++        my $flags = $build->extra_compiler_flags;
++        my @flags = ref($flags) ? @{$flags} : ($flags);
++        $config->push_compiler_flags(@flags);
++    }
+     if ($build->extra_linker_flags) {
+         my $flags = $build->extra_linker_flags;
+         my @flags = ref($flags) ? @{$flags} : ($flags);
+@@ -172,9 +93,9 @@ sub config_kerberos {
+     }
+ 
+     # Check for functions that are different between Heimdal and MIT.
+-    check_funcs($config, ['krb5_xfree']);
++    $config->check_funcs(['krb5_xfree']);
+     my $includes = include($header) . $config->_default_includes;
+-    if ($config->check_decl('krb5_kt_free_entry', undef, undef, $includes)) {
++    if ($config->check_decl('krb5_kt_free_entry', { prologue => $includes })) {
+         $config->define_var('HAVE_DECL_KRB5_KT_FREE_ENTRY',
+             1, 'Defined when krb5_kt_free_entry is declared');
+     }
+@@ -186,8 +107,13 @@ sub config_kerberos {
+ 
+ # Get the compiler and linker flags for Heimdal.  Currently, a new enough
+ # Heimdal to support pkg-config is required.
+-my $compiler_flags = capturex('pkg-config', '--cflags', 'heimdal-kadm-server');
+-my $linker_flags   = capturex('pkg-config', '--libs',   'heimdal-kadm-server');
++my ($compiler_flags, $linker_flags);
++for my $package ('heimdal-krb5', 'heimdal-kadm-server') {
++    $compiler_flags .= q{ } . capturex('pkg-config', '--cflags', $package);
++    $linker_flags   .= q{ } . capturex('pkg-config', '--libs',   $package);
++}
++$compiler_flags =~ s{ ^ \s+ }{}xms;
++$linker_flags =~ s{ ^ \s+ }{}xms;
+ 
+ # Basic package configuration.
+ my $build = Module::Build->new(
+@@ -206,9 +132,19 @@ my $build = Module::Build->new(
+     extra_linker_flags   => [split(q{ }, $linker_flags)],
+     #>>>
+ 
++    # Add additional package metadata.
++    meta_merge => {
++        resources => {
++            repository =>
++              'ssh://git.eyrie.org/srv/git/kerberos/perl-kerberos.git',
++            bugtracker =>
++'https://rt.cpan.org/Public/Dist/Display.html?Name=Authen-Kerberos',
++        },
++    },
++
+     # Other package relationships.
+     configure_requires => {
+-        'Config::AutoConf'    => 0,
++        'Config::AutoConf'    => '0.307',
+         'IPC::System::Simple' => 0,
+         'Module::Build'       => '0.3604',
+         autodie               => 0,
+--- /dev/null
++++ libauthen-kerberos-perl-0.03/Changes
+@@ -0,0 +1,6 @@
++                  User-Visible Authen::Kerberos Changes
++
++Authen::Kerberos 1.00 (unreleased)
++
++    Initial version, only supporting Heimdal and with a very limited
++    subset of the Kerberos and kadmin APIs.
+--- libauthen-kerberos-perl-0.03.orig/TODO
++++ libauthen-kerberos-perl-0.03/TODO
+@@ -1,5 +1,15 @@
+                        Authen::Kerberos To-Do List
+ 
++ * Implement enough of the Kerberos API to support the kstart test suite
++   without needing to run external programs.
++
++ * Name the modules according to whether they were built with MIT or
++   Heimdal and provide wrapper modules that loads the appropriate
++   underling binary module.  Then, support co-installation of the MIT and
++   Heimdal versions and selection at runtime.
++
++ * Add support for the rest of the kadmin API.
++
+  * Figure out a good way of exposing the Kerberos error codes.  After this
+    has been done, document the error codes in chpass exceptions that
+    correspond to password quality checking failures.
+--- libauthen-kerberos-perl-0.03.orig/examples/password-change-report
++++ libauthen-kerberos-perl-0.03/examples/password-change-report
+@@ -15,6 +15,7 @@ use Authen::Kerberos::Kadmin;
+ use Date::Parse qw(str2time);
+ use File::Basename qw(basename);
+ use Getopt::Long qw(GetOptions :config bundling no_ignore_case);
++use Perl6::Slurp qw(slurp);
+ 
+ ##############################################################################
+ # User filtering
+@@ -25,9 +26,9 @@ use Getopt::Long qw(GetOptions :config b
+ # since epoch.
+ #
+ # $filter_ref - Reference to a hash describing the filter to apply
+-#   disabled   - If true, skip disabled users
+-#   expired    - If true, skip users whose password is already expired
+-#   lastchange - Skip users with more recent password changes
++#   disabled    - If true, skip disabled users
++#   expired     - If true, skip users whose password is already expired
++#   last-change - Skip users with more recent password changes
+ # $entry      - Authen::Kerberos::Kadmin::Entry object
+ #
+ # Returns: true if this entry passes filters, false otherwise
+@@ -41,10 +42,14 @@ sub is_entry_included {
+     # Check various filter rules.
+     if ($filter_ref->{disabled} && $disabled) {
+         return;
+-    } elsif ($filter_ref->{expired} && $expires < time) {
+-        return;
+-    } elsif ($filter_ref->{lastchange} > 0) {
+-        if ($lastchange > $filter_ref->{lastchange}) {
++    }
++    if ($filter_ref->{expired} > 0) {
++        if ($expires > 0 && $expires < $filter_ref->{expired}) {
++            return;
++        }
++    }
++    if ($filter_ref->{'last-change'} > 0) {
++        if ($lastchange > $filter_ref->{'last-change'}) {
+             return;
+         }
+     }
+@@ -73,7 +78,7 @@ sub filter_users {
+ 
+     # Walk through the list of users, skipping any that match the exclude
+     # regex if given.
+-  PRICIPAL:
++  PRINCIPAL:
+     for my $principal (@{$principals_ref}) {
+         if ($filter_ref->{exclude}) {
+             next PRINCIPAL if $principal =~ m{ $filter_ref->{exclude} }xms;
+@@ -101,11 +106,11 @@ my $fullpath = $0;
+ local $0 = basename($0);
+ 
+ # Parse command-line options.
++my %config;
+ my @options = qw(
+-  disabled|d exclude|x=s     expired|e
+-  help|h     last-change|l=s realm|r=s
++  disabled|d      exclude|x=s    expired|e=s help|h
++  last-change|l=s principals|p=s realm|r=s
+ );
+-my %config;
+ if (!GetOptions(\%config, @options)) {
+     exit(1);
+ }
+@@ -114,16 +119,25 @@ if ($config{help}) {
+       or die "$0: cannot write to STDOUT: $!\n";
+     exec('perldoc', '-t', $fullpath);
+ }
+-if (!defined($config{lastchange}) || !defined($config{realm})) {
++if (!defined($config{'last-change'}) || !defined($config{realm})) {
+     die "Usage: $0 -l <last-change-date> -r <realm>\n";
+ }
+ 
++# Parse the expiration cutoff date.
++if ($config{expired}) {
++    my $expired = str2time($config{expired});
++    if (!defined($expired)) {
++        die "$0: cannot parse time specification '$config{expired}'\n";
++    }
++    $config{expired} = $expired;
++}
++
+ # Parse the last changed date.
+-my $lastchange = str2time($config{lastchange});
++my $lastchange = str2time($config{'last-change'});
+ if (!defined($lastchange)) {
+-    die "$0: cannot parse time specification '$lastchange'\n";
++    die "$0: cannot parse time specification '$config{'last-change'}'\n";
+ }
+-$config{lastchange} = $lastchange;
++$config{'last-change'} = $lastchange;
+ 
+ # Open the Kerberos database.
+ my $options = {
+@@ -132,8 +146,13 @@ my $options = {
+ };
+ my $kadmin = Authen::Kerberos::Kadmin->new($options);
+ 
+-# Retrieve a list of all principals.
+-my @principals = $kadmin->list(q{*});
++# Retrieve the list of principals.
++my @principals;
++if ($config{principals}) {
++    @principals = slurp($config{principals}, { chomp => 1 });
++} else {
++    @principals = $kadmin->list(q{*});
++}
+ 
+ # Filter the principals against the configuration and output the ones that
+ # pass through the filter.
+@@ -155,8 +174,9 @@ password-change-report - Report users wh
+ 
+ =head1 SYNOPSIS
+ 
+-B<password-change-report> [B<-deh>] [B<-x> I<exclude-pattern>]
+-    B<-l> I<last-change> B<-r> I<realm>
++B<password-change-report> [B<-dh>] [B<-x> I<exclude-pattern>]
++   [B<-p> I<principals-file>] [B<-e> I<expiration-cutoff>]
++   B<-l> I<last-change> B<-r> I<realm>
+ 
+ =head1 REQUIREMENTS
+ 
+@@ -193,16 +213,19 @@ example, depending on your local naming
+ all service principals with random keys might be C<-x />, which excludes
+ all principals containing a C</> in the name.
+ 
+-=item B<-e>, B<--expired>
++=item B<-e> I<date>, B<--expired>=I<date>
+ 
+-Exclude all principals with expired passwords.
++Exclude all principals with passwords that expire before the given date.
++If I<date> is the current time, this will exclude all principals with
++expired passwords.  This only checks the password expiration, not any
++expiration date on the principal itself.
+ 
+ =item B<-h>, B<--help>
+ 
+ Print out this documentation (which is done simply by feeding the script
+ to C<perldoc -t>).
+ 
+-=item B<-l> I<date>, B<--last-change> I<date>
++=item B<-l> I<date>, B<--last-change>=I<date>
+ 
+ Exclude all principals whose keys were changed after I<date>, where
+ I<date> is a date and time in some format that Date::Parse can understand.
+@@ -212,7 +235,13 @@ information.  Be aware that Heimdal norm
+ 
+ This option is required.
+ 
+-=item B<-r> I<realm>, B<--realm> I<realm>
++=item B<-p> I<file>, B<--principals>=I<file>
++
++Rather than scanning the entire contents of the Kerberos KDC database for
++that realm, read the list of principals to check from I<file>.  The file
++should contain one principal per line.
++
++=item B<-r> I<realm>, B<--realm>=I<realm>
+ 
+ The realm of principals to report on.
+ 
